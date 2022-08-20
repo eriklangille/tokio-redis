@@ -1,51 +1,74 @@
-use tokio::net::{TcpListener, TcpStream};
-use mini_redis::{Connection, Frame};
+use mini_redis::client;
+use tokio::sync::{mpsc, oneshot};
 use bytes::Bytes;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
-type Db = Arc<Mutex<HashMap<String, Bytes>>>;
-
-#[tokio::main]
-async fn main() {
-    let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
-
-    println!("Listening");
-
-    let db = Arc::new(Mutex::new(HashMap::new()));
-
-    loop {
-        let (socket, _) = listener.accept().await.unwrap();
-
-        let db = db.clone();
-        tokio::spawn(async move {
-            process(socket, db).await;
-        });
+#[derive(Debug)]
+enum Command {
+    Get {
+        key: String,
+        resp: Responder<Option<Bytes>>,
+    },
+    Set {
+        key: String,
+        val: Bytes,
+        resp: Responder<()>,
     }
 }
 
-async fn process(socket: TcpStream, db : Db) {
-    use mini_redis::Command::{self, Get, Set};
+type Responder<T> = oneshot::Sender<mini_redis::Result<T>>;
 
-    let mut connection = Connection::new(socket);
+#[tokio::main]
+async fn main() {
 
-    while let Some(frame) = connection.read_frame().await.unwrap() {
-        let response = match Command::from_frame(frame).unwrap() {
-            Set(cmd) => {
-                let mut db = db.lock().unwrap();
-                db.insert(cmd.key().to_string(), cmd.value().clone());
-                Frame::Simple("OK".to_string())
-            }
-            Get(cmd) => {
-                let db = db.lock().unwrap();
-                if let Some(value) = db.get(cmd.key()) {
-                    Frame::Bulk(value.clone().into())
-                } else {
-                    Frame::Null
+    let (tx, mut rx) = mpsc::channel(32);
+
+    let manager = tokio::spawn(async move {
+        let mut client = client::connect("127.0.0.1:6379").await.unwrap();
+
+        while let Some(cmd) = rx.recv().await {
+            match cmd {
+                Command::Get { key, resp} => {
+                    let res = client.get(&key).await;
+                    let _ = resp.send(res);
+                }
+                Command::Set {key, val, resp} => {
+                    let res = client.set(&key, val).await;
+                    let _ = resp.send(res);
                 }
             }
-            cmd => panic!("unimplemented {:?}", cmd),
+        }
+    });
+
+    let tx2 = tx.clone();
+
+    let t1 = tokio::spawn(async move {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = Command::Get {
+            key: "hello".to_string(),
+            resp: resp_tx,
         };
-        connection.write_frame(&response).await.unwrap();
-    }
+
+        tx.send(cmd).await.unwrap();
+        let res = resp_rx.await;
+        println!("GOT = {:?}", res);
+    });
+
+    let t2 = tokio::spawn(async move {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = Command::Set {
+            key: "foo".to_string(),
+            val: "bar".into(),
+            resp: resp_tx,
+        };
+
+        tx2.send(cmd).await.unwrap();
+
+        let res = resp_rx.await;
+        println!("GOT = {:?}", res);
+    });
+
+    t1.await.unwrap();
+    t2.await.unwrap();
+    manager.await.unwrap();
+
 }
